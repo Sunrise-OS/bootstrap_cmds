@@ -124,26 +124,63 @@ fn write_server_routine(
     }
     writeln!(w)?;
 
-    // Call the server function
-    let in_args: Vec<String> = rt
-        .args
-        .iter()
-        .filter(|a| matches!(a.direction, Direction::In | Direction::None))
-        .map(|a| format!("In0P->{}", a.name))
-        .collect();
-    let out_args: Vec<String> = rt
-        .args
-        .iter()
-        .filter(|a| matches!(a.direction, Direction::Out | Direction::InOut))
-        .map(|a| format!("&OutP->{}", a.name))
-        .collect();
+    // Real Apple migcom's `intran:`/`outtran:` clauses convert the wire
+    // mach_port_t to/from the kernel object type the routine implementation
+    // actually takes (e.g. `task_t convert_port_to_task_mig(mach_port_t)`);
+    // the Request/Reply structs above always hold the wire (server_type)
+    // representation, so any arg with a translation needs a locally-typed
+    // variable to bridge the two.
+    let mut call_args: Vec<String> = Vec::new();
+    for arg in rt.args.iter() {
+        let has_in = matches!(arg.direction, Direction::In | Direction::InOut | Direction::None);
+        let has_out = matches!(arg.direction, Direction::Out | Direction::InOut);
+        let translated = arg.ty.in_trans.is_some() || arg.ty.out_trans.is_some();
+        let name = &arg.name;
 
-    let all_args: Vec<String> = in_args.into_iter().chain(out_args).collect();
+        if translated {
+            let user_ty = arg
+                .ty
+                .trans_type
+                .as_deref()
+                .or(arg.ty.user_type.as_deref())
+                .unwrap_or("int");
+            if has_in {
+                if let Some(intran) = arg.ty.in_trans.as_deref() {
+                    writeln!(w, "\t{user_ty} {name} = {intran}(In0P->{name});")?;
+                } else {
+                    writeln!(w, "\t{user_ty} {name};")?;
+                }
+            } else {
+                writeln!(w, "\t{user_ty} {name};")?;
+            }
+            call_args.push(if has_out { format!("&{name}") } else { name.clone() });
+        } else if has_out {
+            if has_in {
+                // Untranslated InOut: seed the reply field with the request
+                // value so the callee sees the caller-supplied input.
+                writeln!(w, "\tOutP->{name} = In0P->{name};")?;
+            }
+            call_args.push(format!("&OutP->{name}"));
+        } else {
+            call_args.push(format!("In0P->{name}"));
+        }
+    }
 
     if is_simple {
-        writeln!(w, "\t(void){srv_fn}({});", all_args.join(", "))?;
+        writeln!(w, "\t(void){srv_fn}({});", call_args.join(", "))?;
     } else {
-        writeln!(w, "\tOutP->RetCode = {srv_fn}({});", all_args.join(", "))?;
+        writeln!(w, "\tOutP->RetCode = {srv_fn}({});", call_args.join(", "))?;
+    }
+
+    // Convert translated Out/InOut results back to the wire representation.
+    for arg in rt.args.iter() {
+        let has_out = matches!(arg.direction, Direction::Out | Direction::InOut);
+        if !has_out {
+            continue;
+        }
+        if let Some(outtran) = arg.ty.out_trans.as_deref() {
+            writeln!(w, "\tOutP->{} = {outtran}({});", arg.name, arg.name)?;
+        }
     }
 
     if !is_simple {
