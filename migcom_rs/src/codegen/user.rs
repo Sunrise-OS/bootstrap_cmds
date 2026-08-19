@@ -27,6 +27,14 @@ pub fn write_user(w: &mut dyn Write, stmts: &[Statement], opts: &Options) -> io:
     writeln!(w, "#include <mach/ndr.h>")?;
     writeln!(w, "#include <mach/mig.h>")?;
     writeln!(w, "#include <mach/mig_errors.h>")?;
+    if opts.is_kernel_user {
+        // Kernel-internal caller stubs (`KernelUser` subsystems, e.g.
+        // exc.defs) send via the kernel's own mach_msg_send_from_kernel /
+        // mach_msg_rpc_from_kernel entry points instead of the userspace
+        // mach_msg() trap (mach/message.h only declares mach_msg() when
+        // !KERNEL).
+        writeln!(w, "#include <kern/ipc_mig.h>")?;
+    }
     writeln!(w)?;
     writeln!(w, "/* Includes from Import / UImport directives */")?;
     write_imports(w, stmts, &[ImportKind::Import, ImportKind::UImport])?;
@@ -183,26 +191,42 @@ fn write_user_routine(
 
     // Send (and receive if not simple)
     if is_simple {
-        writeln!(
-            w,
-            "\treturn mach_msg(&InP->Head, MACH_SEND_MSG | MACH_MSG_OPTION_NONE,"
-        )?;
-        writeln!(
-            w,
-            "\t\t(mach_msg_size_t)sizeof(Request), 0, MACH_PORT_NULL,"
-        )?;
-        writeln!(w, "\t\tMACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);")?;
+        if opts.is_kernel_user {
+            writeln!(
+                w,
+                "\treturn mach_msg_send_from_kernel(&InP->Head, (mach_msg_size_t)sizeof(Request));"
+            )?;
+        } else {
+            writeln!(
+                w,
+                "\treturn mach_msg(&InP->Head, MACH_SEND_MSG | MACH_MSG_OPTION_NONE,"
+            )?;
+            writeln!(
+                w,
+                "\t\t(mach_msg_size_t)sizeof(Request), 0, MACH_PORT_NULL,"
+            )?;
+            writeln!(w, "\t\tMACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);")?;
+        }
     } else {
         writeln!(w, "\t{{")?;
-        writeln!(w, "\t\tkern_return_t ret = mach_msg(&InP->Head,")?;
-        writeln!(
-            w,
-            "\t\t\tMACH_SEND_MSG | MACH_RCV_MSG | MACH_MSG_OPTION_NONE,"
-        )?;
-        writeln!(w, "\t\t\t(mach_msg_size_t)sizeof(Request),")?;
-        writeln!(w, "\t\t\t(mach_msg_size_t)sizeof(Reply),")?;
-        writeln!(w, "\t\t\tInP->Head.msgh_local_port,")?;
-        writeln!(w, "\t\t\tMACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);")?;
+        if opts.is_kernel_user {
+            writeln!(
+                w,
+                "\t\tkern_return_t ret = mach_msg_rpc_from_kernel(&InP->Head,"
+            )?;
+            writeln!(w, "\t\t\t(mach_msg_size_t)sizeof(Request),")?;
+            writeln!(w, "\t\t\t(mach_msg_size_t)sizeof(Reply));")?;
+        } else {
+            writeln!(w, "\t\tkern_return_t ret = mach_msg(&InP->Head,")?;
+            writeln!(
+                w,
+                "\t\t\tMACH_SEND_MSG | MACH_RCV_MSG | MACH_MSG_OPTION_NONE,"
+            )?;
+            writeln!(w, "\t\t\t(mach_msg_size_t)sizeof(Request),")?;
+            writeln!(w, "\t\t\t(mach_msg_size_t)sizeof(Reply),")?;
+            writeln!(w, "\t\t\tInP->Head.msgh_local_port,")?;
+            writeln!(w, "\t\t\tMACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);")?;
+        }
         writeln!(w, "\t\tif (ret != MACH_MSG_SUCCESS) return ret;")?;
         writeln!(w, "\t}}")?;
         writeln!(w)?;

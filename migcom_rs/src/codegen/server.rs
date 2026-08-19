@@ -23,6 +23,14 @@ pub fn write_server(w: &mut dyn Write, stmts: &[Statement], opts: &Options) -> i
     writeln!(w, "#include <mach/mig.h>")?;
     writeln!(w, "#include <mach/mig_errors.h>")?;
     writeln!(w)?;
+    // Real Apple migcom emits this boilerplate too (migcom.tproj/utils.c's
+    // WriteBogusDefines): `struct routine_descriptor`'s max_reply_msg field
+    // wants a word-aligned size and mach/mig.h itself doesn't define the
+    // alignment helper.
+    writeln!(w, "#if !defined(_WALIGN)")?;
+    writeln!(w, "#define _WALIGN(x) (((x) + 3) & ~3)")?;
+    writeln!(w, "#endif /* !defined(_WALIGN) */")?;
+    writeln!(w)?;
 
     if let Some(sheader) = opts.server_header_filename.as_deref() {
         if sheader != "/dev/null" {
@@ -241,17 +249,42 @@ fn write_subsystem(
     _opts: &Options,
 ) -> io::Result<()> {
     let subsys_sym = format!("{}_subsystem", subsys);
+    let selector = format!("_{subsys}_server_routine");
+
+    // `struct mig_subsystem`'s first field (mach/mig.h) is a routine
+    // selector callback, used by the generic IPC kobject dispatcher to look
+    // up a routine's stub function from a message id without going through
+    // the per-subsystem demux; real migcom generates one per subsystem.
+    writeln!(w)?;
+    writeln!(w, "/* Routine selector for {subsys_sym} */")?;
+    write_mig_external(w)?;
+    writeln!(w, "mig_routine_t {selector}(mach_msg_header_t *InHeadP)")?;
+    writeln!(w, "{{")?;
+    writeln!(
+        w,
+        "\tint msgh_id = ((mach_msg_id_t)InHeadP->msgh_id) - {base};"
+    )?;
+    writeln!(w, "\tif ((msgh_id >= 0) && (msgh_id < {}))", routines.len())?;
+    writeln!(
+        w,
+        "\t\treturn (mig_routine_t){subsys_sym}.routine[msgh_id].stub_routine;"
+    )?;
+    writeln!(w, "\treturn (mig_routine_t) 0;")?;
+    writeln!(w, "}}")?;
+
     writeln!(w)?;
     writeln!(w, "/* MIG subsystem descriptor */")?;
     writeln!(w, "const struct mig_subsystem {subsys_sym} = {{")?;
+    writeln!(w, "\t{selector},\t/* server */")?;
     writeln!(w, "\t{},\t/* start */", base)?;
     writeln!(w, "\t{},\t/* end */", base + routines.len() as u32)?;
-    writeln!(w, "\tsizeof(mig_reply_error_t),")?;
+    writeln!(w, "\tsizeof(mig_reply_error_t),\t/* maxsize */")?;
+    writeln!(w, "\t(vm_address_t)0,\t/* reserved */")?;
     writeln!(w, "\t{{")?;
     for rt in routines.iter() {
         writeln!(
             w,
-            "\t\t{{ (mig_impl_routine_t)0, (mig_stub_routine_t)_X{name}, 0, 0, _WALIGN(sizeof(mig_reply_error_t)) }},",
+            "\t\t{{ (mig_impl_routine_t)0, (mig_stub_routine_t)_X{name}, 0, 0, (routine_arg_descriptor_t)0, _WALIGN(sizeof(mig_reply_error_t)) }},",
             name = rt.name
         )?;
     }
